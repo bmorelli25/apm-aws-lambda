@@ -18,8 +18,12 @@
 package apmproxy
 
 import (
+	"crypto/tls"
+	"crypto/x509"
+	"net/http"
 	"time"
 
+	"github.com/elastic/apm-aws-lambda/accumulator"
 	"go.uber.org/zap"
 )
 
@@ -74,12 +78,55 @@ func WithSendStrategy(strategy SendStrategy) Option {
 // WithAgentDataBufferSize sets the agent data buffer size.
 func WithAgentDataBufferSize(size int) Option {
 	return func(c *Client) {
-		c.DataChannel = make(chan AgentData, size)
+		c.AgentDataChannel = make(chan accumulator.APMData, size)
 	}
 }
 
+// WithLogger configures a custom zap logger to be used by
+// the client.
 func WithLogger(logger *zap.SugaredLogger) Option {
 	return func(c *Client) {
 		c.logger = logger
+	}
+}
+
+// WithBatch configures a batch to be used for batching data
+// before sending to APM Server.
+func WithBatch(batch *accumulator.Batch) Option {
+	return func(c *Client) {
+		c.batch = batch
+	}
+}
+
+func WithRootCerts(certs string) Option {
+	return func(c *Client) {
+		EnsureTlsConfig(c)
+		transportClient := c.client.Transport.(*http.Transport)
+		if transportClient.TLSClientConfig.RootCAs == nil {
+			transportClient.TLSClientConfig.RootCAs = DefaultCertPool()
+		}
+		transportClient.TLSClientConfig.RootCAs.AppendCertsFromPEM([]byte(certs))
+	}
+}
+
+func WithVerifyCerts(verify bool) Option {
+	return func(c *Client) {
+		EnsureTlsConfig(c)
+		transportClient := c.client.Transport.(*http.Transport)
+		transportClient.TLSClientConfig.InsecureSkipVerify = !verify
+	}
+}
+
+func DefaultCertPool() *x509.CertPool {
+	certPool, _ := x509.SystemCertPool()
+	if certPool == nil {
+		certPool = &x509.CertPool{}
+	}
+	return certPool
+}
+func EnsureTlsConfig(c *Client) {
+	transportClient := c.client.Transport.(*http.Transport)
+	if transportClient.TLSClientConfig == nil {
+		transportClient.TLSClientConfig = &tls.Config{}
 	}
 }

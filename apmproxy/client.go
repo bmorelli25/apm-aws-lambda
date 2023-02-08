@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/elastic/apm-aws-lambda/accumulator"
 	"go.uber.org/zap"
 )
 
@@ -46,13 +47,15 @@ const (
 	defaultDataForwarderTimeout time.Duration = 3 * time.Second
 	defaultReceiverAddr                       = ":8200"
 	defaultAgentBufferSize      int           = 100
+	defaultLambdaBufferSize     int           = 100
 )
 
 // Client is the client used to communicate with the apm server.
 type Client struct {
 	mu                sync.RWMutex
 	bufferPool        sync.Pool
-	DataChannel       chan AgentData
+	AgentDataChannel  chan accumulator.APMData
+	LambdaDataChannel chan []byte
 	client            *http.Client
 	Status            Status
 	ReconnectionCount int
@@ -65,6 +68,8 @@ type Client struct {
 
 	flushMutex sync.Mutex
 	flushCh    chan struct{}
+
+	batch *accumulator.Batch
 }
 
 func NewClient(opts ...Option) (*Client, error) {
@@ -72,7 +77,8 @@ func NewClient(opts ...Option) (*Client, error) {
 		bufferPool: sync.Pool{New: func() interface{} {
 			return &bytes.Buffer{}
 		}},
-		DataChannel: make(chan AgentData, defaultAgentBufferSize),
+		AgentDataChannel:  make(chan accumulator.APMData, defaultAgentBufferSize),
+		LambdaDataChannel: make(chan []byte, defaultLambdaBufferSize),
 		client: &http.Client{
 			Transport: http.DefaultTransport.(*http.Transport).Clone(),
 		},

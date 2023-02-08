@@ -14,6 +14,8 @@ DATE_FMT = +%Y%m%d%H%M.%S
 # 2. 'date -r': BSD date. It does not support '-d'.
 BUILD_DATE = $(shell date -u -d "@${SOURCE_DATE_EPOCH}" "${DATE_FMT}" 2>/dev/null || date -u -r "${SOURCE_DATE_EPOCH}" "${DATE_FMT}")
 
+GO_BUILDFLAGS ?= -trimpath -ldflags="-s -w"
+
 ifndef GOARCH
 	GOARCH=amd64
 endif
@@ -34,21 +36,21 @@ NOTICE.txt: go.mod
 	@bash ./scripts/notice.sh
 
 check-licenses:
-	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf .
-	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf -ext .java .
-	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf -ext .js .
+	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf -exclude testing .
+	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf -exclude testing -ext .java .
+	go run github.com/elastic/go-licenser@v0.4.0 -d -exclude tf -exclude testing -ext .js .
 
 update-licenses:
-	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf .
-	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf -ext .java .
-	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf -ext .js .
+	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf -exclude testing .
+	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf -exclude testing -ext .java .
+	go run github.com/elastic/go-licenser@v0.4.0 -exclude tf -exclude testing -ext .js .
 
 lint:
 	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.48.0 version
 	go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.48.0 run
 
 build: check-licenses NOTICE.txt
-	CGO_ENABLED=0 GOOS=linux go build -o bin/extensions/apm-lambda-extension main.go
+	CGO_ENABLED=0 GOOS=linux go build ${GO_BUILDFLAGS} -o bin/extensions/apm-lambda-extension main.go
 	cp NOTICE.txt bin/NOTICE.txt
 	cp dependencies.asciidoc bin/dependencies.asciidoc
 
@@ -115,6 +117,21 @@ publish: validate-layer-name validate-aws-default-region
 		--license "Apache-2.0" \
 		--zip-file "fileb://./bin/extension.zip"
 
+# Delete the given LAYER in all the AWS regions
+delete-in-all-aws-regions: validate-layer-name get-all-aws-regions
+	@mkdir -p $(AWS_FOLDER)
+	@while read AWS_DEFAULT_REGION; do \
+		echo "delete '$(ELASTIC_LAYER_NAME)-$(ARCHITECTURE)' in $${AWS_DEFAULT_REGION}"; \
+		AWS_DEFAULT_REGION="$${AWS_DEFAULT_REGION}" ELASTIC_LAYER_NAME=$(ELASTIC_LAYER_NAME) $(MAKE) delete; \
+	done <.regions
+
+# Delete the given LAYER in the given AWS region, it won't fail
+delete: validate-layer-name validate-aws-default-region
+	@aws lambda \
+		delete-layer-version \
+		--layer-name "$(ELASTIC_LAYER_NAME)-$(ARCHITECTURE)" \
+		--version-number 1 || echo "delete-layer-version $(ELASTIC_LAYER_NAME)-$(ARCHITECTURE) for $${AWS_DEFAULT_REGION} could not be found"
+
 # Grant public access to the given LAYER in the given AWS region
 grant-public-layer-access: validate-layer-name validate-aws-default-region
 	@echo "[debug] $(ELASTIC_LAYER_NAME)-$(ARCHITECTURE) with version: $$($(MAKE) -s --no-print-directory get-version)"
@@ -172,3 +189,35 @@ validate-aws-default-region:
 ifndef AWS_DEFAULT_REGION
 	$(error AWS_DEFAULT_REGION is undefined)
 endif
+
+##############################################################################
+# Smoke tests -- Basic smoke tests for the APM Lambda extension
+##############################################################################
+
+SMOKETEST_VERSIONS ?= latest
+SMOKETEST_DIRS = $$(find ./tf -mindepth 0 -maxdepth 0 -type d)
+
+.PHONY: smoketest/discover
+smoketest/discover:
+	@echo "$(SMOKETEST_DIRS)"
+
+.PHONY: smoketest/run
+smoketest/run: build
+	@ for version in $(shell echo $(SMOKETEST_VERSIONS) | tr ',' ' '); do \
+		echo "-> Running $(TEST_DIR) smoke tests for version $${version}..."; \
+		cd $(TEST_DIR) && ./test.sh $${version}; \
+	done
+
+.PHONY: smoketest/cleanup
+smoketest/cleanup:
+	@ cd $(TEST_DIR); \
+	if [ -f "./cleanup.sh" ]; then \
+		./cleanup.sh; \
+	fi
+
+.PHONY: smoketest/all
+smoketest/all/cleanup:
+	@ for test_dir in $(SMOKETEST_DIRS); do \
+		echo "-> Cleanup $${test_dir} smoke tests..."; \
+		$(MAKE) smoketest/cleanup TEST_DIR=$${test_dir}; \
+	done

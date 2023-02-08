@@ -1,5 +1,5 @@
-include::{docs-root}/shared/versions/stack/current.asciidoc[]
-include::{docs-root}/shared/attributes.asciidoc[]
+include::{asciidoc-dir}/../../shared/versions/stack/current.asciidoc[]
+include::{asciidoc-dir}/../../shared/attributes.asciidoc[]
 
 ifdef::env-github[]
 NOTE: For the best reading experience,
@@ -7,3 +7,5 @@ please view this documentation at https://www.elastic.co/guide/en/ecs-logging/go
 endif::[]
 
 include::monitoring-aws-lambda.asciidoc[]
+
+include::release-notes.asciidoc[]

@@ -29,6 +29,8 @@ import (
 	"math/rand"
 	"net/http"
 	"time"
+
+	"github.com/elastic/apm-aws-lambda/accumulator"
 )
 
 type jsonResult struct {
@@ -40,28 +42,30 @@ type jsonError struct {
 	Document string `json:"document,omitempty"`
 }
 
-// ForwardApmData receives agent data as it comes in and posts it to the APM server.
-// Stop checking for, and sending agent data when the function invocation
+// ForwardApmData receives apm data as it comes in and posts it to the APM server.
+// Stop checking for, and sending apm data when the function invocation
 // has completed, signaled via a channel.
-func (c *Client) ForwardApmData(ctx context.Context, metadataContainer *MetadataContainer) error {
+func (c *Client) ForwardApmData(ctx context.Context) error {
 	if c.IsUnhealthy() {
+		c.logger.Warn("Failed to start APM data forwarder due to client unhealthy")
 		return nil
 	}
+	var lambdaDataChan chan []byte
 	for {
 		select {
 		case <-ctx.Done():
 			c.logger.Debug("Invocation context cancelled, not processing any more agent data")
 			return nil
-		case agentData := <-c.DataChannel:
-			if metadataContainer.Metadata == nil {
-				metadata, err := ProcessMetadata(agentData)
-				if err != nil {
-					return fmt.Errorf("failed to extract metadata from agent payload %w", err)
-				}
-				metadataContainer.Metadata = metadata
+		case data := <-c.AgentDataChannel:
+			if err := c.forwardAgentData(ctx, data); err != nil {
+				return err
 			}
-			if err := c.PostToApmServer(ctx, agentData); err != nil {
-				return fmt.Errorf("error sending to APM server, skipping: %v", err)
+			// Wait for metadata to be available, metadata will be available as soon as
+			// the first agent data is processed.
+			lambdaDataChan = c.LambdaDataChannel
+		case data := <-lambdaDataChan:
+			if err := c.forwardLambdaData(ctx, data); err != nil {
+				return err
 			}
 		}
 	}
@@ -74,15 +78,38 @@ func (c *Client) FlushAPMData(ctx context.Context) {
 		return
 	}
 	c.logger.Debug("Flush started - Checking for agent data")
+
+	// Flush agent data first to make sure metadata is available if possible
+	for i := len(c.AgentDataChannel); i > 0; i-- {
+		data := <-c.AgentDataChannel
+		if err := c.forwardAgentData(ctx, data); err != nil {
+			c.logger.Errorf("Error sending to APM Server, skipping: %v", err)
+		}
+	}
+
+	// If metadata still not available then fail fast
+	if c.batch == nil {
+		c.logger.Warnf("Metadata not available at flush, skipping sending lambda data to APM Server")
+		return
+	}
+
+	// Flush lambda data
 	for {
 		select {
-		case agentData := <-c.DataChannel:
-			c.logger.Debug("Flush in progress - Processing agent data")
-			if err := c.PostToApmServer(ctx, agentData); err != nil {
+		case apmData := <-c.LambdaDataChannel:
+			c.logger.Debug("Flush in progress - Processing lambda data")
+			if err := c.forwardLambdaData(ctx, apmData); err != nil {
 				c.logger.Errorf("Error sending to APM server, skipping: %v", err)
 			}
+		case <-ctx.Done():
+			c.logger.Debug("Failed to flush completely, may result in data drop")
+			return
 		default:
-			c.logger.Debug("Flush ended - No agent data on buffer")
+			// Flush any remaining data in batch
+			if err := c.sendBatch(ctx); err != nil {
+				c.logger.Errorf("Error sending to APM server, skipping: %v", err)
+			}
+			c.logger.Debug("Flush ended for lambda data - no data in buffer")
 			return
 		}
 	}
@@ -93,7 +120,7 @@ func (c *Client) FlushAPMData(ctx context.Context) {
 // The function compresses the APM agent data, if it's not already compressed.
 // It sets the APM transport status to failing upon errors, as part of the backoff
 // strategy.
-func (c *Client) PostToApmServer(ctx context.Context, agentData AgentData) error {
+func (c *Client) PostToApmServer(ctx context.Context, apmData accumulator.APMData) error {
 	// todo: can this be a streaming or streaming style call that keeps the
 	//       connection open across invocations?
 	if c.IsUnhealthy() {
@@ -101,11 +128,11 @@ func (c *Client) PostToApmServer(ctx context.Context, agentData AgentData) error
 	}
 
 	endpointURI := "intake/v2/events"
-	encoding := agentData.ContentEncoding
+	encoding := apmData.ContentEncoding
 
 	var r io.Reader
-	if agentData.ContentEncoding != "" {
-		r = bytes.NewReader(agentData.Data)
+	if apmData.ContentEncoding != "" {
+		r = bytes.NewReader(apmData.Data)
 	} else {
 		encoding = "gzip"
 		buf := c.bufferPool.Get().(*bytes.Buffer)
@@ -117,7 +144,7 @@ func (c *Client) PostToApmServer(ctx context.Context, agentData AgentData) error
 		if err != nil {
 			return err
 		}
-		if _, err := gw.Write(agentData.Data); err != nil {
+		if _, err := gw.Write(apmData.Data); err != nil {
 			return fmt.Errorf("failed to compress data: %w", err)
 		}
 		if err := gw.Close(); err != nil {
@@ -281,17 +308,6 @@ func (c *Client) ComputeGracePeriod() time.Duration {
 	return time.Duration((gracePeriodWithoutJitter + jitter*gracePeriodWithoutJitter) * float64(time.Second))
 }
 
-// EnqueueAPMData adds a AgentData struct to the agent data channel, effectively queueing for a send
-// to the APM server.
-func (c *Client) EnqueueAPMData(agentData AgentData) {
-	select {
-	case c.DataChannel <- agentData:
-		c.logger.Debug("Adding agent data to buffer to be sent to apm server")
-	default:
-		c.logger.Warn("Channel full: dropping a subset of agent data")
-	}
-}
-
 // ShouldFlush returns true if the client should flush APM data after processing the event.
 func (c *Client) ShouldFlush() bool {
 	return c.sendStrategy == SyncFlush
@@ -312,4 +328,32 @@ func (c *Client) WaitForFlush() <-chan struct{} {
 	c.flushMutex.Lock()
 	defer c.flushMutex.Unlock()
 	return c.flushCh
+}
+
+func (c *Client) forwardAgentData(ctx context.Context, apmData accumulator.APMData) error {
+	if err := c.batch.AddAgentData(apmData); err != nil {
+		c.logger.Warnf("Dropping agent data due to error: %v", err)
+	}
+	if c.batch.ShouldShip() {
+		return c.sendBatch(ctx)
+	}
+	return nil
+}
+
+func (c *Client) forwardLambdaData(ctx context.Context, data []byte) error {
+	if err := c.batch.AddLambdaData(data); err != nil {
+		c.logger.Warnf("Dropping lambda data due to error: %v", err)
+	}
+	if c.batch.ShouldShip() {
+		return c.sendBatch(ctx)
+	}
+	return nil
+}
+
+func (c *Client) sendBatch(ctx context.Context) error {
+	if c.batch == nil || c.batch.Count() == 0 {
+		return nil
+	}
+	defer c.batch.Reset()
+	return c.PostToApmServer(ctx, c.batch.ToAPMData())
 }

@@ -18,11 +18,9 @@
 package logsapi
 
 import (
-	"errors"
 	"math"
+	"time"
 
-	"github.com/elastic/apm-aws-lambda/apmproxy"
-	"github.com/elastic/apm-aws-lambda/extension"
 	"go.elastic.co/apm/v2/model"
 	"go.elastic.co/fastjson"
 )
@@ -63,12 +61,10 @@ func (mc MetricsContainer) MarshalFastJSON(json *fastjson.Writer) error {
 	return nil
 }
 
-func ProcessPlatformReport(metadataContainer *apmproxy.MetadataContainer, functionData *extension.NextEventResponse, platformReport LogEvent) (apmproxy.AgentData, error) {
-
-	if metadataContainer == nil || len(metadataContainer.Metadata) == 0 {
-		return apmproxy.AgentData{}, errors.New("metadata is not populated")
-	}
-
+// ProcessPlatformReport processes the `platform.report` log line from lambda logs API and
+// returns a byte array containing the JSON body for the extracted platform metrics. A non
+// nil error is returned when marshaling of platform metrics into JSON fails.
+func ProcessPlatformReport(fnARN string, deadlineMs int64, ts time.Time, platformReport LogEvent) ([]byte, error) {
 	metricsContainer := MetricsContainer{
 		Metrics: &model.Metrics{},
 	}
@@ -82,7 +78,7 @@ func ProcessPlatformReport(metadataContainer *apmproxy.MetadataContainer, functi
 	// FaaS Fields
 	metricsContainer.Metrics.FAAS = &model.FAAS{
 		Execution: platformReport.Record.RequestID,
-		ID:        functionData.InvokedFunctionArn,
+		ID:        fnARN,
 		Coldstart: platformReportMetrics.InitDurationMs > 0,
 	}
 
@@ -99,18 +95,12 @@ func ProcessPlatformReport(metadataContainer *apmproxy.MetadataContainer, functi
 	// - The epoch corresponding to the end of the current invocation (its "deadline")
 	// - The epoch corresponding to the start of the current invocation
 	// - The multiplication / division then rounds the value to obtain a number of ms that can be expressed a multiple of 1000 (see initial assumption)
-	metricsContainer.Add("faas.timeout", math.Ceil(float64(functionData.DeadlineMs-functionData.Timestamp.UnixMilli())/1e3)*1e3) // Unit : Milliseconds
+	metricsContainer.Add("faas.timeout", math.Ceil(float64(deadlineMs-ts.UnixMilli())/1e3)*1e3) // Unit : Milliseconds
 
 	var jsonWriter fastjson.Writer
 	if err := metricsContainer.MarshalFastJSON(&jsonWriter); err != nil {
-		return apmproxy.AgentData{}, err
+		return nil, err
 	}
 
-	capacity := len(metadataContainer.Metadata) + jsonWriter.Size() + 1 // 1 for newline
-	metricsData := make([]byte, len(metadataContainer.Metadata), capacity)
-	copy(metricsData, metadataContainer.Metadata)
-
-	metricsData = append(metricsData, []byte("\n")...)
-	metricsData = append(metricsData, jsonWriter.Bytes()...)
-	return apmproxy.AgentData{Data: metricsData}, nil
+	return jsonWriter.Bytes(), nil
 }

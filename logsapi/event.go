@@ -20,9 +20,6 @@ package logsapi
 import (
 	"context"
 	"time"
-
-	"github.com/elastic/apm-aws-lambda/apmproxy"
-	"github.com/elastic/apm-aws-lambda/extension"
 )
 
 // LogEventType represents the log type that is received in the log messages
@@ -33,6 +30,7 @@ const (
 	PlatformRuntimeDone LogEventType = "platform.runtimeDone"
 	PlatformFault       LogEventType = "platform.fault"
 	PlatformReport      LogEventType = "platform.report"
+	PlatformLogsDropped LogEventType = "platform.logsDropped"
 	PlatformStart       LogEventType = "platform.start"
 	PlatformEnd         LogEventType = "platform.end"
 	FunctionLog         LogEventType = "function"
@@ -53,17 +51,18 @@ type LogEventRecord struct {
 	Metrics   PlatformMetrics `json:"metrics"`
 }
 
-// ProcessLogs consumes events until a RuntimeDone event corresponding
-// to requestID is received, or ctx is canceled, and then returns.
+// ProcessLogs consumes log events until there are no more log events that
+// can be consumed or ctx is cancelled. For INVOKE event this state is
+// reached when runtimeDone event for the current requestID is processed
+// whereas for SHUTDOWN event this state is reached when the platformReport
+// event for the previous requestID is processed.
 func (lc *Client) ProcessLogs(
 	ctx context.Context,
 	requestID string,
 	invokedFnArn string,
-	apmClient *apmproxy.Client,
-	metadataContainer *apmproxy.MetadataContainer,
-	runtimeDoneSignal chan struct{},
-	prevEvent *extension.NextEventResponse,
-) error {
+	dataChan chan []byte,
+	isShutdown bool,
+) {
 	// platformStartReqID is to identify the requestID for the function
 	// logs under the assumption that function logs for a specific request
 	// ID will be bounded by PlatformStart and PlatformEnd events.
@@ -71,53 +70,72 @@ func (lc *Client) ProcessLogs(
 	for {
 		select {
 		case logEvent := <-lc.logsChannel:
-			lc.logger.Debugf("Received log event %v", logEvent.Type)
+			lc.logger.Debugf("Received log event %v for request ID %s", logEvent.Type, logEvent.Record.RequestID)
 			switch logEvent.Type {
 			case PlatformStart:
 				platformStartReqID = logEvent.Record.RequestID
-			// Check the logEvent for runtimeDone and compare the RequestID
-			// to the id that came in via the Next API
 			case PlatformRuntimeDone:
-				if logEvent.Record.RequestID == requestID {
-					lc.logger.Info("Received runtimeDone event for this function invocation")
-					runtimeDoneSignal <- struct{}{}
-					return nil
+				if err := lc.invocationLifecycler.OnLambdaLogRuntimeDone(
+					logEvent.Record.RequestID,
+					logEvent.Record.Status,
+					logEvent.Time,
+				); err != nil {
+					lc.logger.Warnf("Failed to finalize invocation with request ID %s: %v", logEvent.Record.RequestID, err)
 				}
-
-				lc.logger.Debug("Log API runtimeDone event request id didn't match")
-			// Check if the logEvent contains metrics and verify that they can be linked to the previous invocation
+				// For invocation events the platform.runtimeDone would be the last possible event.
+				if !isShutdown && logEvent.Record.RequestID == requestID {
+					lc.logger.Debugf(
+						"Processed runtime done event for reqID %s as the last log event for the invocation",
+						logEvent.Record.RequestID,
+					)
+					return
+				}
 			case PlatformReport:
-				if prevEvent != nil && logEvent.Record.RequestID == prevEvent.RequestID {
-					lc.logger.Debug("Received platform report for the previous function invocation")
-					processedMetrics, err := ProcessPlatformReport(metadataContainer, prevEvent, logEvent)
-					if err != nil {
-						lc.logger.Errorf("Error processing Lambda platform metrics : %v", err)
-					} else {
-						apmClient.EnqueueAPMData(processedMetrics)
-					}
+				fnARN, deadlineMs, ts, err := lc.invocationLifecycler.OnPlatformReport(logEvent.Record.RequestID)
+				if err != nil {
+					lc.logger.Warnf("Failed to process platform report: %v", err)
 				} else {
-					lc.logger.Warn("report event request id didn't match the previous event id")
-					lc.logger.Debug("Log API runtimeDone event request id didn't match")
+					lc.logger.Debugf("Received platform report for %s", logEvent.Record.RequestID)
+					processedMetrics, err := ProcessPlatformReport(fnARN, deadlineMs, ts, logEvent)
+					if err != nil {
+						lc.logger.Errorf("Error processing Lambda platform metrics: %v", err)
+					} else {
+						select {
+						case dataChan <- processedMetrics:
+						case <-ctx.Done():
+						}
+					}
 				}
+				// For shutdown event the platform report metrics for the previous log event
+				// would be the last possible log event. After processing this metric the
+				// invocation lifecycler's cache should be empty.
+				if isShutdown && lc.invocationLifecycler.Size() == 0 {
+					lc.logger.Debugf(
+						"Processed platform report event for reqID %s as the last log event before shutdown",
+						logEvent.Record.RequestID,
+					)
+					return
+				}
+			case PlatformLogsDropped:
+				lc.logger.Warnf("Logs dropped due to extension falling behind: %v", logEvent.Record)
 			case FunctionLog:
-				// TODO: @lahsivjar Buffer logs and send batches of data to APM-Server.
-				// Buffering should account for metadata being available before sending.
-				lc.logger.Debug("Received function log")
 				processedLog, err := ProcessFunctionLog(
-					metadataContainer,
 					platformStartReqID,
 					invokedFnArn,
 					logEvent,
 				)
 				if err != nil {
-					lc.logger.Errorf("Error processing function log : %v", err)
+					lc.logger.Warnf("Error processing function log : %v", err)
 				} else {
-					apmClient.EnqueueAPMData(processedLog)
+					select {
+					case dataChan <- processedLog:
+					case <-ctx.Done():
+					}
 				}
 			}
 		case <-ctx.Done():
 			lc.logger.Debug("Current invocation over. Interrupting logs processing goroutine")
-			return nil
+			return
 		}
 	}
 }

@@ -27,14 +27,14 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"github.com/elastic/apm-aws-lambda/accumulator"
+	"github.com/tidwall/gjson"
 )
 
-type AgentData struct {
-	Data            []byte
-	ContentEncoding string
-}
+const txnRegistrationContentType = "application/vnd.elastic.apm.transaction+json"
 
-// StartHttpServer starts the server listening for APM agent data.
+// StartReceiver starts the server listening for APM agent data.
 func (c *Client) StartReceiver() error {
 	mux := http.NewServeMux()
 
@@ -45,6 +45,7 @@ func (c *Client) StartReceiver() error {
 
 	mux.HandleFunc("/", handleInfoRequest)
 	mux.HandleFunc("/intake/v2/events", c.handleIntakeV2Events())
+	mux.HandleFunc("/register/transaction", c.handleTransactionRegistration())
 
 	c.receiver.Handler = mux
 
@@ -82,13 +83,16 @@ func (c *Client) handleInfoRequest() (func(w http.ResponseWriter, r *http.Reques
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(parsedApmServerUrl)
 
-	customTransport := http.DefaultTransport.(*http.Transport).Clone()
-	customTransport.ResponseHeaderTimeout = c.client.Timeout
-	reverseProxy.Transport = customTransport
+	reverseProxy.Transport = c.client.Transport.(*http.Transport).Clone()
 
 	reverseProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		c.UpdateStatus(r.Context(), Failing)
+		// Don't update the status of the transport as it is possible that the extension
+		// is frozen while processing the request and context is canceled due to timeout.
 		c.logger.Errorf("Error querying version from the APM server: %v", err)
+
+		// Server is unreachable, return StatusBadGateway (default behaviour) to avoid
+		// returning a Status OK.
+		w.WriteHeader(http.StatusBadGateway)
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -123,13 +127,17 @@ func (c *Client) handleIntakeV2Events() func(w http.ResponseWriter, r *http.Requ
 
 		agentFlushed := r.URL.Query().Get("flushed") == "true"
 
-		agentData := AgentData{
+		agentData := accumulator.APMData{
 			Data:            rawBytes,
 			ContentEncoding: r.Header.Get("Content-Encoding"),
 		}
 
 		if len(agentData.Data) != 0 {
-			c.EnqueueAPMData(agentData)
+			select {
+			case c.AgentDataChannel <- agentData:
+			default:
+				c.logger.Warnf("Channel full: dropping a subset of agent data")
+			}
 		}
 
 		if agentFlushed {
@@ -154,6 +162,39 @@ func (c *Client) handleIntakeV2Events() func(w http.ResponseWriter, r *http.Requ
 		w.WriteHeader(http.StatusAccepted)
 		if _, err = w.Write([]byte("ok")); err != nil {
 			c.logger.Errorf("Failed to send intake response to APM agent : %v", err)
+		}
+	}
+}
+
+// URL: http://server/register/transaction
+func (c *Client) handleTransactionRegistration() func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Content-Type") != txnRegistrationContentType {
+			w.WriteHeader(http.StatusUnsupportedMediaType)
+			return
+		}
+		reqID := r.Header.Get("x-elastic-aws-request-id")
+		if reqID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		rawBytes, err := io.ReadAll(r.Body)
+		defer r.Body.Close()
+		if err != nil {
+			c.logger.Warnf("Failed to read transaction registration body: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		txnID := gjson.GetBytes(rawBytes, "transaction.id").String()
+		if txnID == "" {
+			c.logger.Warn("Could not parse transaction id from transaction registration body")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		if err := c.batch.OnAgentInit(reqID, txnID, rawBytes); err != nil {
+			c.logger.Warnf("Failed to update invocation for transaction ID %s: %v", txnID, err)
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
 		}
 	}
 }

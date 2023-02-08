@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package apmproxy_test
+package accumulator
 
 import (
 	"bytes"
 	"compress/gzip"
 	"compress/zlib"
-	"github.com/elastic/apm-aws-lambda/apmproxy"
 	"io"
 	"testing"
 
@@ -133,8 +132,8 @@ func Test_processMetadata(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			agentData := apmproxy.AgentData{Data: tc.data(), ContentEncoding: tc.encodingType}
-			extractedMetadata, err := apmproxy.ProcessMetadata(agentData)
+			agentData := APMData{Data: tc.data(), ContentEncoding: tc.encodingType}
+			extractedMetadata, err := ProcessMetadata(agentData)
 
 			if tc.expectError != nil {
 				require.Nil(t, extractedMetadata)
@@ -167,12 +166,12 @@ func BenchmarkProcessMetadata(b *testing.B) {
 	}
 
 	for _, bench := range benchmarks {
-		agentData := apmproxy.AgentData{Data: bench.body, ContentEncoding: ""}
+		agentData := APMData{Data: bench.body, ContentEncoding: ""}
 
 		b.Run(bench.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				_, _ = apmproxy.ProcessMetadata(agentData)
+				_, _ = ProcessMetadata(agentData)
 			}
 		})
 	}
